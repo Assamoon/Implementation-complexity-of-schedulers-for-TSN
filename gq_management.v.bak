@@ -1,0 +1,167 @@
+module gq_management(
+	input			clk_i,
+	input			rst_i,
+
+	input           gq_req_i,
+	output          gq_ack_o,
+	input  [4:0]    port_no_i,
+	input  [10:0]   gq_len_i,
+	input           gq_vld_i,
+	output          gq_rdy_o,
+	input  [7:0]    gq_data_i,
+
+	output          gq_vld_o,
+	input           gq_rdy_i,
+	output [39:0]   gq_info_o,
+	input           bd_rd_i,
+	input  [6:0]    bd_raddr0_i,
+	input  [5:0]    bd_raddr1_i,
+	output [7:0]    bd_rdata_o
+);
+
+localparam  GQ_IDLE = 2'b00,
+			GQ_PIPELINE = 2'b01,
+			GQ_ENQ  = 2'b10;
+
+//128*64Byte BD array
+reg [7:0] bd_mm  [0:127][0:63];
+
+//bd chain RAM
+//reg [39:0] bd_info [0:127];
+reg [7:0] bd_chain_idx;
+reg [1:0] enqueue_cur_st;
+reg [1:0] enqueue_nxt_st;
+reg [4:0] bd_num_req;
+reg [5:0] last_len;
+reg [7:0] chain_idx;
+reg [5:0] bd_len_cnt;
+reg [10:0] gq_len_cnt;
+
+
+always@(posedge clk_i) begin
+	if(rst_i) begin
+		enqueue_cur_st <= GQ_IDLE;
+	end else begin
+		enqueue_cur_st <= enqueue_nxt_st;
+	end
+end
+
+assign gq_ack_o = (enqueue_cur_st == GQ_ENQ) && gq_vld_i && gq_rdy_o && (gq_len_cnt == gq_len_i);
+
+always@(posedge clk_i) begin
+	if(rst_i) begin
+		bd_num_req <= 0;
+		last_len   <= 0;
+	end else if(enqueue_cur_st == GQ_IDLE && gq_req_i && (~gq_ack_o)) begin
+		bd_num_req <= gq_len_i[10:6] + |gq_len_i[5:0];
+		last_len   <= |gq_len_i[5:0] ? gq_len_i[5:0] : 6'd63;
+	end else if(enqueue_cur_st == GQ_PIPELINE && (bd_num_req != 1)) begin
+		bd_num_req <= bd_num_req - 1'b1;
+	end
+end
+
+always@(posedge clk_i) begin
+	if(rst_i) begin
+		bd_chain_idx <= 0;
+	end else if(enqueue_cur_st == GQ_IDLE && gq_req_i) begin
+		bd_chain_idx <= chain_idx;
+	end else if(&bd_len_cnt) begin
+		bd_chain_idx <= bd_chain_idx + 1'b1;
+	end
+end
+
+always@(posedge clk_i) begin
+	if(rst_i) begin
+		chain_idx <= 0;
+	end else if(enqueue_cur_st == GQ_PIPELINE) begin
+		chain_idx <= chain_idx + 1'b1;
+	end
+end
+
+assign gq_rdy_o = (enqueue_cur_st == GQ_ENQ);
+
+always@(posedge clk_i) begin
+	if(rst_i) begin
+		bd_len_cnt <= 0;
+	end else if((enqueue_cur_st == GQ_ENQ) && gq_vld_i && gq_rdy_o) begin
+		bd_len_cnt <= bd_len_cnt + 1'b1;
+	end
+end
+
+always@(posedge clk_i) begin
+    if(rst_i) begin
+        gq_len_cnt <= 0;
+	end if((enqueue_cur_st == GQ_IDLE)) begin
+	    gq_len_cnt <= 0;
+	end if((enqueue_cur_st == GQ_ENQ) && gq_vld_i && gq_rdy_o) begin
+		gq_len_cnt <= gq_len_cnt + 1'b1;
+	end
+end
+
+always@(posedge clk_i) begin
+	if((enqueue_cur_st == GQ_ENQ) && gq_vld_i && gq_rdy_o) begin
+		bd_mm[bd_chain_idx][bd_len_cnt[5:0]] <= gq_data_i;
+	end
+end
+
+assign bd_rdata_o = bd_mm[bd_raddr0_i[6:0]][bd_raddr1_i[5:0]];
+
+always@(*) begin
+	case(enqueue_cur_st)
+		GQ_IDLE: begin
+			if(gq_req_i) enqueue_nxt_st = GQ_PIPELINE;
+			else         enqueue_nxt_st = GQ_IDLE;
+		end
+		GQ_PIPELINE: begin
+			if(bd_num_req == 1) enqueue_nxt_st = GQ_ENQ;
+			else                enqueue_nxt_st = GQ_PIPELINE;
+		end
+		GQ_ENQ: begin
+			if(gq_len_cnt == gq_len_i && gq_vld_i && gq_rdy_o) enqueue_nxt_st = GQ_IDLE;
+			else                       enqueue_nxt_st = GQ_ENQ;  
+		end
+		default: enqueue_nxt_st = GQ_IDLE;
+	endcase
+end
+
+wire [39:0] bd_info_nxt;
+wire        bd_fifo_wr;
+wire        bd_fifo_full;
+wire        bd_fifo_rd;
+wire        bd_fifo_empty;
+wire [39:0] bd_info_q;
+
+assign bd_fifo_wr      = (enqueue_cur_st == GQ_PIPELINE) & (~bd_fifo_full);
+assign bd_info_nxt[39] = ((enqueue_cur_st == GQ_PIPELINE) && (bd_num_req == gq_len_i[10:6] +|gq_len_i[5:0]));
+assign bd_info_nxt[38] = ((enqueue_cur_st == GQ_PIPELINE) && (bd_num_req == 1));
+assign bd_info_nxt[37:32] = bd_info_nxt[38] ? last_len : 6'd63;
+assign bd_info_nxt[31:16] = bd_info_nxt[38] ? 0 : (chain_idx + 1'b1);
+assign bd_info_nxt[15:11] = port_no_i;
+assign bd_info_nxt[10:0]  = gq_len_i;
+
+assign bd_fifo_rd = ~bd_fifo_empty & gq_rdy_i;
+assign gq_vld_o   = ~bd_fifo_empty;
+assign gq_info_o  = bd_info_q;
+
+//bd_info_fifo bd_info_fifo(
+//	.wrclk(clk_i),
+//	.data(bd_info_nxt),
+//	.wrreq(bd_fifo_wr),
+//	.wrfull(bd_fifo_full),
+
+//	.rdclk(clk_i),
+//	.rdreq(bd_fifo_rd),
+//	.rdempty(bd_fifo_empty),
+//	.q(bd_info_q)
+//);
+
+fifo_generator_0 bd_info_fifo (
+  .clk(clk_i),      // input wire clk  
+  .din(bd_info_nxt),      // input wire [39 : 0] din
+  .wr_en(bd_fifo_wr),  // input wire wr_en
+  .rd_en(bd_fifo_rd),  // input wire rd_en
+  .dout(bd_info_q),    // output wire [39 : 0] dout
+  .full(bd_fifo_full),    // output wire full
+  .empty(bd_fifo_empty)  // output wire empty
+);
+endmodule
